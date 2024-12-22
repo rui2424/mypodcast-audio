@@ -1,123 +1,131 @@
 import os
+import hashlib
 import requests
-import feedparser
-from pathlib import Path
-from xml.etree.ElementTree import Element, SubElement, ElementTree
+import xml.etree.ElementTree as ET
 import subprocess
+from pathlib import Path
 
-# 定数
+# RSSフィードのURL
 RSS_FEED_URL = "https://www.nhk.or.jp/s-media/news/podcast/list/v1/all.xml"
-OUTPUT_DIR = "output"
+# 出力ディレクトリ
+OUTPUT_DIR = Path("output")
+DOWNLOADS_DIR = Path("downloads")
 UPDATED_FEED_FILE = "updated_feed.xml"
-GITHUB_PAGES_BASE_URL = "https://rui2424.github.io/mypodcast-audio/"  # 自分のGitHub Pages URLに置き換える
+REMOTE_URL = "https://github.com/<rui2424>/<mypodcast-audio>.git"  # リポジトリURLを設定してください
 
-def fetch_rss_feed(url):
-    """RSSフィードを取得する"""
-    print(f"{url} からRSSフィードを取得中...")
-    response = requests.get(url)
+# ディレクトリの作成
+OUTPUT_DIR.mkdir(exist_ok=True)
+DOWNLOADS_DIR.mkdir(exist_ok=True)
+
+
+def download_file(url, output_path):
+    """指定したURLからファイルをダウンロード"""
+    response = requests.get(url, stream=True)
     response.raise_for_status()
-    return feedparser.parse(response.content.decode("utf-8"))
+    with open(output_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
 
-def check_and_replace_files(feed_entries, output_dir):
-    """RSS内のMP3ファイルとoutputフォルダ内のMP3を比較して置き換える"""
-    replaced_files = []
-    for entry in feed_entries:
-        mp3_url = None
-        for link in entry.links:
-            if "audio" in link.type and link.href.endswith(".mp3"):
-                mp3_url = link.href
-                break
 
-        if not mp3_url:
-            continue  # MP3リンクがない場合はスキップ
+def calculate_hash(file_path):
+    """ファイルのMD5ハッシュを計算"""
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
 
-        # MP3ファイル名を取得
-        file_name = os.path.basename(mp3_url)
-        output_file_path = Path(output_dir) / file_name
 
-        if output_file_path.exists():
-            print(f"調整済みファイルを発見: {output_file_path}")
-            # GitHub PagesのURLを生成
-            github_url = GITHUB_PAGES_BASE_URL + file_name
-            # 置き換え対象としてリストに追加
-            replaced_files.append((mp3_url, github_url))
+def normalize_audio(input_file, output_file):
+    """音声ファイルを正規化"""
+    command = [
+        "ffmpeg", "-i", input_file, "-af", "loudnorm", "-y", output_file
+    ]
+    subprocess.run(command, check=True)
 
-    return replaced_files
 
-def update_rss_feed(feed, replaced_files, output_file):
-    """RSSフィードを更新して保存する"""
-    root = Element("rss", attrib={"version": "2.0"})
-    channel = SubElement(root, "channel")
+def process_rss_feed():
+    """RSSフィードを処理し、音声をダウンロード・正規化"""
+    print(f"{RSS_FEED_URL} からRSSフィードを取得中...")
+    response = requests.get(RSS_FEED_URL)
+    response.raise_for_status()
+    rss_feed = response.content
 
-    # RSS情報を作成
-    for entry in feed.entries:
-        item = SubElement(channel, "item")
-        title = SubElement(item, "title")
-        title.text = entry.title
+    root = ET.fromstring(rss_feed)
+    namespace = {"itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd"}
 
-        description = SubElement(item, "description")
-        description.text = entry.get("description", "")
+    processed_files = []
+    for item in root.findall(".//item"):
+        enclosure = item.find("enclosure")
+        if enclosure is None:
+            continue
 
-        link = SubElement(item, "link")
-        link.text = entry.get("link", "リンクがありません")  # 修正済み
+        audio_url = enclosure.get("url")
+        if not audio_url:
+            continue
 
-        # MP3リンクを修正
-        mp3_url = None
-        for link_info in entry.links:
-            if "audio" in link_info.type and link_info.href.endswith(".mp3"):
-                mp3_url = link_info.href
-                break
+        file_name = audio_url.split("/")[-1]
+        download_path = DOWNLOADS_DIR / file_name
 
-        if mp3_url:
-            # 置き換えリンクがあれば更新
-            replaced_file = next((f[1] for f in replaced_files if f[0] == mp3_url), None)
-            if replaced_file:
-                new_link = SubElement(item, "enclosure", attrib={
-                    "url": replaced_file,
-                    "type": "audio/mpeg"
-                })
-            else:
-                new_link = SubElement(item, "enclosure", attrib={
-                    "url": mp3_url,
-                    "type": "audio/mpeg"
-                })
+        # ダウンロード
+        if not download_path.exists():
+            print(f"音声ファイルをダウンロード中: {audio_url}")
+            download_file(audio_url, download_path)
 
-    # RSSフィードを保存
-    tree = ElementTree(root)
-    tree.write(output_file, encoding="utf-8", xml_declaration=True)
-    print(f"新しいRSSフィードを {output_file} に保存しました。")
+        # ハッシュ計算
+        audio_hash = calculate_hash(download_path)
+        output_file = OUTPUT_DIR / f"{audio_hash}_{file_name}"
 
-def upload_to_github(file_path):
-    """生成されたファイルをGitHubにアップロードする"""
+        # 正規化済みでない場合のみ処理
+        if not output_file.exists():
+            print(f"音声ファイルを正規化中: {download_path} → {output_file}")
+            normalize_audio(download_path, output_file)
+        else:
+            print(f"調整済みファイルを発見: {output_file}")
+
+        # URLの置き換え
+        new_url = f"https://<あなたのGitHubユーザー名>.github.io/<リポジトリ名>/{output_file.name}"
+        enclosure.set("url", new_url)
+        processed_files.append(output_file)
+
+    # 更新されたRSSフィードを保存
+    tree = ET.ElementTree(root)
+    tree.write(UPDATED_FEED_FILE, encoding="utf-8", xml_declaration=True)
+    print(f"新しいRSSフィードを {UPDATED_FEED_FILE} に保存しました。")
+
+    return processed_files
+
+
+def upload_to_github():
+    """GitHubに更新をプッシュ"""
     try:
-        # 未追跡ファイルを含めてすべて追加
+        # リモートリポジトリの確認
+        result = subprocess.run(["git", "remote", "-v"], capture_output=True, text=True)
+        if "origin" not in result.stdout:
+            # リモートリポジトリを追加
+            print(f"リモートリポジトリを設定中: {REMOTE_URL}")
+            subprocess.run(["git", "remote", "add", "origin", REMOTE_URL], check=True)
+
+        # 変更を追加してコミット
         subprocess.run(["git", "add", "-A"], check=True)
-        subprocess.run(["git", "commit", "-m", f"Update {file_path}"], check=True)
-        subprocess.run(["git", "push"], check=True)
-        print(f"{file_path} をGitHubにアップロードしました。")
+        subprocess.run(["git", "commit", "-m", f"Update {UPDATED_FEED_FILE}"], check=True)
+
+        # プッシュ（初回は-uオプションを追加）
+        subprocess.run(["git", "push", "-u", "origin", "master"], check=True)
+        print(f"GitHubにアップロードが完了しました。")
     except subprocess.CalledProcessError as e:
         print("GitHubへのアップロードに失敗しました:", e)
 
-# メイン処理
+
+def main():
+    """メイン関数"""
+    try:
+        processed_files = process_rss_feed()
+        print(f"{len(processed_files)} 件の音声ファイルが処理されました。")
+        upload_to_github()
+    except Exception as e:
+        print("エラーが発生しました:", e)
+
+
 if __name__ == "__main__":
-    # RSSフィードを取得
-    feed = fetch_rss_feed(RSS_FEED_URL)
-
-    if feed.entries:
-        # 調整済みファイルの確認と置き換え
-        replaced_files = check_and_replace_files(feed.entries, OUTPUT_DIR)
-
-        if replaced_files:
-            print(f"{len(replaced_files)} 件の調整済みファイルをRSSフィードに反映します。")
-            for original_url, adjusted_file in replaced_files:
-                print(f"置き換え: {original_url} → {adjusted_file}")
-
-            # RSSフィードを更新
-            update_rss_feed(feed, replaced_files, UPDATED_FEED_FILE)
-
-            # GitHubにアップロード
-            upload_to_github(UPDATED_FEED_FILE)
-        else:
-            print("調整済みファイルは見つかりませんでした。")
-    else:
-        print("RSSフィード内にエントリが見つかりませんでした。")
+    main()
