@@ -84,7 +84,7 @@ def process_rss_feed():
             print(f"調整済みファイルを発見: {output_file}")
 
         # URLの置き換え
-        new_url = f"https://<あなたのGitHubユーザー名>.github.io/<リポジトリ名>/{output_file.name}"
+        new_url = f"https://<rui2424>.github.io/<mypodcast-audio>/{output_file.name}"
         enclosure.set("url", new_url)
         processed_files.append(output_file)
 
